@@ -1,11 +1,14 @@
-from mcp.server import Server
-from mcp.server.streamable_http import StreamableHTTPServerTransport
+import contextlib
+from collections.abc import AsyncIterator
+
+from mcp.server.lowlevel import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse, Response
-from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.types import Receive, Scope, Send
 from mcp.types import Tool, TextContent
 from azure.identity import DefaultAzureCredential
 from azure.search.documents import SearchClient
@@ -30,9 +33,6 @@ MCP_PORT = int(os.getenv("MCP_PORT", "9000"))
 
 # Initialize the MCP server
 server = Server("azure-search-mcp")
-
-# SSE transport for SSE-based clients
-sse_transport = SseServerTransport("/messages")
 
 def get_credential():
     """Get Azure credential - uses API key if provided, otherwise DefaultAzureCredential."""
@@ -326,6 +326,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # SSE handlers
 async def handle_sse(request):
     """Handle SSE connections from MCP clients (GET /sse)."""
+    sse_transport = SseServerTransport("/messages")
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
@@ -335,47 +336,54 @@ async def handle_sse(request):
 
 async def handle_messages(request):
     """Handle POST messages from SSE clients (POST /messages)."""
+    sse_transport = SseServerTransport("/messages")
     await sse_transport.handle_post_message(request.scope, request.receive, request._send)
 
 def main():
     """Run the MCP server on HTTP port."""
     logger.info(f"Starting Azure AI Search MCP Server on http://0.0.0.0:{MCP_PORT}")
-    logger.info(f"SSE endpoint: GET http://localhost:{MCP_PORT}/sse")
-    logger.info(f"Messages endpoint: POST http://localhost:{MCP_PORT}/messages")
-    logger.info(f"Streamable HTTP endpoint: POST http://localhost:{MCP_PORT}/mcp")
+    logger.info(f"Streamable HTTP endpoint: http://localhost:{MCP_PORT}/mcp")
     
-    # Streamable HTTP endpoint handler
-    async def mcp_endpoint(request):
-        transport = StreamableHTTPServerTransport(
-            mcp_session_id=request.headers.get("mcp-session-id"),
-            is_json_response_enabled=True
-        )
-        return await transport.handle_request(
-            request.scope, request.receive, request._send,
-            server, server.create_initialization_options()
-        )
-    
-    app = Starlette(
-        debug=True,
-        middleware=[
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
-                allow_headers=["*"],
-                expose_headers=["mcp-session-id"],
-            )
-        ],
-        routes=[
-            # SSE transport (for Claude Desktop, etc.)
-            Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            Route("/messages", endpoint=handle_messages, methods=["POST"]),
-            # Streamable HTTP transport (for other clients)
-            Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]),
-        ],
+    # Create the session manager for Streamable HTTP transport
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,  # Use JSON responses for better compatibility
+        stateless=True,      # Stateless mode for simpler deployment
     )
     
-    uvicorn.run(app, host="0.0.0.0", port=MCP_PORT)
+    # ASGI handler for streamable HTTP connections
+    async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
+        await session_manager.handle_request(scope, receive, send)
+    
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        """Context manager for managing session manager lifecycle."""
+        async with session_manager.run():
+            logger.info("MCP Server started with StreamableHTTP session manager!")
+            try:
+                yield
+            finally:
+                logger.info("MCP Server shutting down...")
+    
+    # Create an ASGI application using the transport
+    starlette_app = Starlette(
+        debug=True,
+        routes=[
+            Mount("/mcp", app=handle_streamable_http),
+        ],
+        lifespan=lifespan,
+    )
+    
+    # Wrap ASGI application with CORS middleware
+    starlette_app = CORSMiddleware(
+        starlette_app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["Mcp-Session-Id"],
+    )
+    
+    uvicorn.run(starlette_app, host="0.0.0.0", port=MCP_PORT)
 
 if __name__ == "__main__":
     main()
