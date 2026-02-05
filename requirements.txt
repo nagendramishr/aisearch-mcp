@@ -1,0 +1,6 @@
+mcp
+azure-identity
+azure-search-documents
+python-dotenv
+uvicorn
+starlette
